@@ -1,0 +1,8 @@
+<launch>
+    <param name="/joy_node/dev" value="/dev/input/js0" />
+
+    <node name="joy" pkg="joy" type="joy_node" output="screen">
+
+    <node name="arm_teleop" pkg="arm_teleop" type="arm_teleop.py" output="screen">
+    </node>
+</launch>

@@ -1,42 +1,57 @@
 #!/usr/bin/env python3
+import math
 import rospy
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import Twist, Pose
 from ros_robot_pkg.srv import desiredTCP, setValue, moveRobotRelative
 from std_srvs.srv import Trigger
+from math import sin, cos
+
+DEBUG = False
 
 class JoystickTeleop:
     def __init__(self):
-        # 1. Initialize Node
+        # Initialize Node
         rospy.init_node('joystick_teleop_node', anonymous=False)
-
-        # 2. Configuration
+        
+        # Retrieve frame list from parameter server
+        ee_frames = rospy.get_param('/ee_frames', [])
+        if ee_frames == []:
+            rospy.logwarn("No end-effector frames found on parameter server '/ee_frames'. Using default ['TCP'].")
+            ee_frames = ['TCP']
+        
+        rospy.loginfo(f"End-Effector Frames: {ee_frames}")
+        
+        # Configuration
         self.config = {
-            'frame_list': ['TCP', 'davis', 'pressure_ft'],
+            'frame_list': list(ee_frames),
             'speed_presets': [0.05, 0.2, 0.5], 
+            'linear_step': 0.001, # 1 mm
+            'angular_step': 0.01745/2.0, # ~ 0.5 degree in radians
             'button_map': {
-                'deadman': 4,
-                'shift': 5,
-                'mode_switch': 7,
+                'enable': 4, # LB
+                'shift': 5, # RB
+                'rot_shift': 2, # X (Rotation Shift)
+                'mode_switch': 7, # Start
                 'next_frame': 0,# A
                 'next_speed': 1 # B
             },
-        'axis_map': {
-                # UPDATE THESE KEYS:
-                'stick_left_x': 0,   # Left/Right (was linear_y)
-                'stick_left_y': 1,   # Up/Down (was linear_x)
-                'stick_right_x': 3,  # Yaw (was angular_z)
-                'stick_right_y': 4,  # Z (was linear_z)
-                'dpad_v': 7,
-                'dpad_h': 6
+            'axis_map': {
+
+                'stick_left_x': 0, # Left Stick Horizontal
+                'stick_left_y': 1, # Left Stick Vertical
+                'stick_right_x': 3, # Right Stick Horizontal
+                'stick_right_y': 4, # Right Stick Vertical
+                'dpad_v': 7, # D-Pad Vertical
+                'dpad_h': 6 # D-Pad Horizontal
             }        }
 
-        # 3. Internal State
+        # Internal State
         self.state = {
             'current_frame_idx': 0,
             'current_speed_idx': 0,
             'last_buttons': [], 
-            'deadman_active': False,
+            'enable_active': False,
             'last_dpad_v_val': 0.0,   
             'last_dpad_h_val': 0.0,   
             'last_joy_time': 0,
@@ -46,7 +61,7 @@ class JoystickTeleop:
 
         self.current_cmd_vel = Twist()
         
-        # 4. Communications placeholders
+        # Communications placeholders
         self.pub_vel = None
         self.sub_joy = None
         self.srv_set_tcp = None
@@ -55,10 +70,10 @@ class JoystickTeleop:
         self.srv_stop = None
         self.srv_reupload = None
         
-        # 5. Startup
+        # Startup
         self._init_communications()
         
-        # 6. Start Heartbeat (50Hz)
+        # Start Heartbeat (50Hz)
         self.timer = rospy.Timer(rospy.Duration(1.0/50.0), self._control_loop)
 
     def _init_communications(self):
@@ -91,48 +106,47 @@ class JoystickTeleop:
         """
         self.state['last_joy_time'] = rospy.get_time()
         
-        # 1. Update Deadman
-        self.state['deadman_active'] = self._process_safety(msg)
+        # Update Enable
+        self.state['enable_active'] = self._process_safety(msg)
 
-        if not self.state['deadman_active']:
+        if not self.state['enable_active']:
             self._reset_button_states()
-            self._stop_robot() # Zeros out the class variable
+            self._stop_robot()
             return
 
-        # 2. Update Velocity Variable (FIXED: Updates class variable)
+        # Update Velocity Variable
         self._process_velocity(msg)
 
-        # 3. Handle Discrete Actions
+        # Handle Discrete Actions
         self._process_buttons(msg)
 
     def _control_loop(self, event):
         """
         Heartbeat: Publishes self.current_cmd_vel at 50Hz
         """
-        # 1. Skip if Service is busy (D-Pad logic)
+        # Skip if Service is busy (D-Pad logic)
         if self.state['service_busy']: 
-            # DEBUG PRINT
-            # rospy.loginfo_throttle(1.0, "[Teleop] Heartbeat PAUSED (Busy)")
+            if DEBUG:
+                rospy.loginfo_throttle(1.0, "[Teleop] Heartbeat PAUSED (Busy)")
             return
 
-        # 2. NEW: Silence the heartbeat in POSITION mode
-        # This prevents waking up the velocity script with "0.0" commands
+        # Silence the heartbeat in POSITION mode. This prevents waking up the velocity script with "0.0" commands
         if self.state['control_mode'] == 'POSITION':
             return
-        # 2. Safety Gate (Deadman must be held)
-        # Note: We REMOVED the time check. As long as 'deadman_active' is True 
-        # (which it stays until you release the button), we keep publishing.
-        if not self.state['deadman_active']:
+        
+        # Safety (Enable must be held)
+
+        if not self.state['enable_active']:
             self.current_cmd_vel = Twist()
         
-        # 3. Publish
+        # Publish
         self.pub_vel.publish(self.current_cmd_vel)
         
-        # DEBUG PRINT
-        # rospy.loginfo_throttle(0.5, f"[Teleop] Heartbeat sending: {self.current_cmd_vel.linear.x:.2f}")
+        if DEBUG:
+            rospy.loginfo_throttle(0.5, f"[Teleop] Heartbeat sending: {self.current_cmd_vel.linear.x:.2f}")
         
     def _process_safety(self, msg):
-        idx = self.config['button_map']['deadman']
+        idx = self.config['button_map']['enable']
         if idx < len(msg.buttons):
             return msg.buttons[idx] == 1
         return False
@@ -142,23 +156,23 @@ class JoystickTeleop:
 
     def _reset_button_states(self):
         self.state['last_buttons'] = []
-        # Do not reset dpad val here to prevent triggers on resume
 
     def _apply_deadzone(self, value, threshold=0.1):
         if abs(value) < threshold: return 0.0
         return value
 
     def _process_velocity(self, msg):
-        # 1. Gatekeeper: Only allow in VELOCITY mode
+        # Only allow in VELOCITY mode
         if self.state['control_mode'] != 'VELOCITY':
             self.current_cmd_vel = Twist()
             return
 
-        speed = self.config['speed_presets'][self.state['current_speed_idx']]
+        linear_speed = self.config['speed_presets'][self.state['current_speed_idx']]
+        angular_speed = self.config['speed_presets'][self.state['current_speed_idx']] * 2.0
         map_ax = self.config['axis_map']
         map_btn = self.config['button_map']
 
-        # 2. Check Shift State (RB)
+        # Check Shift State (RB)
         shift_active = False
         if map_btn['shift'] < len(msg.buttons):
             shift_active = msg.buttons[map_btn['shift']] == 1
@@ -168,24 +182,24 @@ class JoystickTeleop:
         rx = self._apply_deadzone(msg.axes[map_ax['stick_right_x']])
         ry = self._apply_deadzone(msg.axes[map_ax['stick_right_y']])
 
-        # 3. Apply Logic
+        # Apply Logic
         if not shift_active:
             # --- STANDARD MODE (Translation + Yaw) ---
-            self.current_cmd_vel.linear.x = ly * speed  # Fwd/Back
-            self.current_cmd_vel.linear.y = lx * speed  # Left/Right
-            self.current_cmd_vel.linear.z = ry * speed  # Up/Down
-            self.current_cmd_vel.angular.z = rx * speed # Yaw
+            self.current_cmd_vel.linear.x = ly * linear_speed   # Fwd/Back
+            self.current_cmd_vel.linear.y = lx * linear_speed   # Left/Right
+            self.current_cmd_vel.linear.z = ry * linear_speed   # Up/Down
+            self.current_cmd_vel.angular.z = rx * angular_speed # Yaw
             
-            # Zero out others
+            # Zero out others for safety
             self.current_cmd_vel.angular.x = 0.0
             self.current_cmd_vel.angular.y = 0.0
             
         else:
             # --- ROTATION MODE (Pitch/Roll) ---
-            self.current_cmd_vel.angular.y = ly * speed # Pitch (Left Stick Y)
-            self.current_cmd_vel.angular.x = rx * speed # Roll (Right Stick X)
+            self.current_cmd_vel.angular.y = ly * angular_speed # Pitch (Left Stick Y)
+            self.current_cmd_vel.angular.x = rx * angular_speed # Roll (Right Stick X)
             
-            # Safety: Zero out translation
+            # Zero out others for safety
             self.current_cmd_vel.linear.x = 0.0
             self.current_cmd_vel.linear.y = 0.0
             self.current_cmd_vel.linear.z = 0.0
@@ -194,9 +208,9 @@ class JoystickTeleop:
     def _toggle_control_mode(self):
         if self.state['control_mode'] == 'VELOCITY':
             # SWITCHING TO POSITION MODE
-            rospy.loginfo(">>> SWITCHING TO POSITION MODE (Jogging) <<<")
+            rospy.loginfo(">>> SWITCHING TO POSITION MODE (1 mm step) <<<")
             
-            # 1. Stop Robot & Kill Velocity Script
+            # Stop Robot & Kill Velocity Script on teach pendant
             self.state['service_busy'] = True # Pause Heartbeat
             self._stop_robot()
             self.pub_vel.publish(self.current_cmd_vel)
@@ -204,7 +218,7 @@ class JoystickTeleop:
             try:
                 self.srv_stop()         # Kill speedL script
                 rospy.sleep(0.5)        # Wait for controller to settle
-                self.srv_reupload()     # Upload standard script (Heavy Op)
+                self.srv_reupload()     # Upload standard script (takes time maybe 1-2 seconds)
                 rospy.sleep(0.5)        # Wait for script to be ready
                 
                 self.state['control_mode'] = 'POSITION'
@@ -216,22 +230,22 @@ class JoystickTeleop:
 
         else:
             # SWITCHING TO VELOCITY MODE
-            rospy.loginfo(">>> SWITCHING TO VELOCITY MODE (Sticks) <<<")
-            # No heavy lifting needed; speedL takes over automatically
+            rospy.loginfo(">>> SWITCHING TO VELOCITY MODE. Use Sticks <<<")
             self.state['control_mode'] = 'VELOCITY'
+            
     def _process_buttons(self, msg):
         # Init history
         if len(self.state['last_buttons']) != len(msg.buttons):
             self.state['last_buttons'] = [0] * len(msg.buttons)
 
-        # --- MODE SWITCH (Button 7) ---
+        # --- MODE SWITCH ---
         btn_mode = self.config['button_map']['mode_switch']
         if msg.buttons[btn_mode] == 1 and self.state['last_buttons'][btn_mode] == 0:
             self._toggle_control_mode()
             
-        # A. Buttons
+        # Buttons
         for action, btn_idx in self.config['button_map'].items():
-            if action == 'deadman': continue
+            if action in ['enable', 'shift', 'rot_shift', 'mode_switch']: continue
 
             if msg.buttons[btn_idx] == 1 and self.state['last_buttons'][btn_idx] == 0:
                 if action == 'next_frame':
@@ -241,45 +255,51 @@ class JoystickTeleop:
 
         self.state['last_buttons'] = list(msg.buttons)
 
-        # B. D-Pad Step Logic
+        # D-Pad Step Logic
         if self.state['control_mode'] == 'POSITION':
             map_ax = self.config['axis_map']            
+            map_btn = self.config['button_map']
             
-            # 1. Read Inputs
+            # Read Inputs
             curr_v = msg.axes[map_ax['dpad_v']] # Up/Down
             curr_h = msg.axes[map_ax['dpad_h']] # Left/Right
             
-            # 2. Check Shift (RB) for Z-Axis toggle
-            shift_active = False
-            if self.config['button_map']['shift'] < len(msg.buttons):
-                shift_active = msg.buttons[self.config['button_map']['shift']] == 1
-
-            # 3. Detect Rising Edge (Prevent holding)
-            # We track V and H separately to allow diagonal presses if needed (though rare)
-            
-            # --- Vertical Axis (X or Z) ---
+            # Check Shift (RB) for Z-Axis toggle
+            lin_shift = False
+            if map_btn['shift'] < len(msg.buttons):
+                lin_shift = msg.buttons[map_btn['shift']] == 1            
+                
+            # Check Shift (X) for Rotation toggle
+            rot_shift = False
+            if map_btn['rot_shift'] < len(msg.buttons):
+                rot_shift = msg.buttons[map_btn['rot_shift']] == 1
+            # Detect Rising Edge to prevent repeated actions on hold
+                        
+            # --- Vertical Axis ---
             if curr_v != 0 and self.state['last_dpad_v_val'] == 0:
                 step_dir = 1 if curr_v > 0 else -1
                 
-                if shift_active:
-                    # Shift + Up/Down -> Z Axis
-                    self._action_step_move('z', step_dir)
+                if rot_shift:
+                    self._action_step_move('pitch', step_dir) # Rot Y
+                elif lin_shift:
+                    self._action_step_move('z', step_dir)     # Lin Z
                 else:
-                    # Up/Down -> X Axis (Forward/Back)
-                    self._action_step_move('x', step_dir)
-
+                    self._action_step_move('x', step_dir)     # Lin X
+            
             # --- Horizontal Axis (Y) ---
-            # Note: You might need to add 'last_dpad_h_val' to self.state if you want strict debounce per axis
             if curr_h != 0 and self.state.get('last_dpad_h_val', 0) == 0:
                 step_dir = 1 if curr_h > 0 else -1
-                # Left/Right -> Y Axis
-                self._action_step_move('y', step_dir)
-
+                
+                if rot_shift:
+                    self._action_step_move('roll', step_dir)  # Rot X
+                else:
+                    self._action_step_move('y', step_dir)     # Lin Y
+                    
             # Update State
             self.state['last_dpad_v_val'] = curr_v
             self.state['last_dpad_h_val'] = curr_h
                     
-    # --- ACTIONS ---
+    # ACTIONS
     def _action_cycle_frame(self):
         self.state['current_frame_idx'] = (self.state['current_frame_idx'] + 1) % len(self.config['frame_list'])
         target = self.config['frame_list'][self.state['current_frame_idx']]
@@ -299,20 +319,31 @@ class JoystickTeleop:
             pass
 
     def _action_step_move(self, axis, direction):
-        step = 0.001 * direction
+        step = self.config['linear_step'] * direction
         frame = self.config['frame_list'][self.state['current_frame_idx']]
         target = Pose()
         target.orientation.w = 1.0
         
-        # Select Axis
-        if axis == 'x':
-            target.position.x = step
-        elif axis == 'y':
-            target.position.y = step
-        elif axis == 'z':
-            target.position.z = step
+        # Linear Steps
+        if axis in ['x', 'y', 'z']:
+            step = self.config['linear_step'] * direction
+            if axis == 'x': target.position.x = step
+            elif axis == 'y': target.position.y = step
+            elif axis == 'z': target.position.z = step
+            rospy.loginfo(f"Step Lin {axis.upper()} {step*1000:.1f}mm")
+
+        # Angular Steps in Quaternions
+        elif axis in ['pitch', 'roll']:
+            step = self.config['angular_step'] * direction
+            # Half-angle formula for quaternion: sin(theta/2)
+            sin_half = math.sin(step / 2.0)
+            cos_half = math.cos(step / 2.0)
+            
+            target.orientation.w = cos_half
+            if axis == 'roll':  target.orientation.x = sin_half # Rot around X
+            if axis == 'pitch': target.orientation.y = sin_half # Rot around Y
+            rospy.loginfo(f"Step Rot {axis.upper()} {math.degrees(step):.2f}deg")
         
-        rospy.loginfo(f"Step {axis.upper()} {step*1000}mm in {frame}")
         self.srv_move_relative(frame=frame, target_pose=target, relative_frame=frame)
         
 if __name__ == "__main__":
